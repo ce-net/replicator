@@ -1,0 +1,19 @@
+[package]
+name = "replicator"
+version = "0.1.0"
+edition = "2024"
+description = "Self-replicating fleet bootstrapper — an application on CE. Uses rdev (push + spawn) to bring up CE nodes on other machines and ce-cap delegation to hand each replica a strictly-weaker key, so a fleet grows as an attenuating capability tree rooted at a shared org key."
+license = "MIT"
+repository = "https://github.com/ce-net/replicator"
+
+[dependencies]
+ce-rs = { git = "https://github.com/ce-net/ce-rs" }   # mesh transport (AppRequest/reply) + status
+ce-cap = { git = "https://github.com/ce-net/ce" }      # the capability verifier + delegation primitive
+ce-identity = { git = "https://github.com/ce-net/ce" } # the signing identity (delegations are signed)
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+dirs-next = "2"
