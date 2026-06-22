@@ -3,13 +3,29 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+
 jobs:
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
+  build-test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Unit + integration tests
+
+      # replicator depends on ce-rs, ce-cap and ce-identity as *git* dependencies
+      # (ce-cap/ce-identity live inside github.com/ce-net/ce), so cargo fetches them
+      # itself during the build. No sibling checkout is needed — and actions/checkout
+      # cannot place a repo at ../ce outside $GITHUB_WORKSPACE anyway. If these ever
+      # become path deps, add a sibling `actions/checkout` per dep (ce-net/ce as
+      # ../ce, ce-net/ce-rs as ../ce-rs) plus a `[patch]` in Cargo.toml.
+
+      - name: Build
+        run: cargo build --all --locked
+
+      - name: Test
         run: cargo test --all --locked
