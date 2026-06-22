@@ -427,4 +427,264 @@ mod tests {
         assert!(parse_node_id(&"a".repeat(63)).is_err());
         assert!(parse_node_id("zz").is_err());
     }
+
+    // ---------------------------------------------------------------------
+    // Extended suite: attenuation invariants, delegation failure-injection,
+    // chain-depth properties, and wire-type serde round-trips.
+    // ---------------------------------------------------------------------
+
+    /// Property: `onward_abilities` output is ALWAYS a subset of the parent's abilities
+    /// intersected with the replication set — it can never introduce a new ability.
+    #[test]
+    fn onward_abilities_never_introduces_new_powers() {
+        let cases: &[&[&str]] = &[
+            &[],
+            &["sync"],
+            &["spawn"],
+            &["sync", "spawn"],
+            &["tunnel", "exec"],                  // none replicable
+            &["sync", "spawn", "tunnel", "exec"], // mixed
+            &["spawn", "spawn"],                  // duplicate parent ability
+        ];
+        for parent in cases {
+            let parent: Vec<String> = parent.iter().map(|s| s.to_string()).collect();
+            for replicate in [true, false] {
+                let child = onward_abilities(&parent, replicate);
+                for ability in &child {
+                    assert!(
+                        parent.contains(ability),
+                        "introduced {ability:?} not held by parent {parent:?}"
+                    );
+                    assert!(
+                        REPLICATION_ABILITIES.contains(&ability.as_str()),
+                        "non-replication ability {ability:?} leaked through"
+                    );
+                    if !replicate {
+                        assert_ne!(ability, "spawn", "leaf must never carry spawn");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn onward_abilities_empty_parent_yields_nothing() {
+        assert!(onward_abilities(&[], true).is_empty());
+        assert!(onward_abilities(&[], false).is_empty());
+    }
+
+    #[test]
+    fn onward_abilities_only_non_replicable_yields_nothing() {
+        let parent = vec!["tunnel".to_string(), "exec".to_string()];
+        assert!(onward_abilities(&parent, true).is_empty());
+        assert!(onward_abilities(&parent, false).is_empty());
+    }
+
+    /// Property: for any (now, ttl) and any parent caveats, the attenuated expiry is
+    /// `narrower_or_equal`: it never exceeds the parent (when the parent is finite) and
+    /// is always finite for the child.
+    #[test]
+    fn attenuate_expiry_is_monotone_narrowing() {
+        let now = 1_000u64;
+        for parent_exp in [0u64, 1, 999, 1_000, 1_001, 5_000, u64::MAX] {
+            for ttl in [0u64, 1, 500, 100_000, u64::MAX] {
+                let p = Caveats { not_after: parent_exp, ..Default::default() };
+                let child = attenuate(&p, now, ttl);
+                // child is always finite
+                assert_ne!(child.not_after, 0, "child must get a finite expiry");
+                if parent_exp != 0 {
+                    assert!(
+                        child.not_after <= parent_exp,
+                        "child {} outlives parent {} (ttl={ttl})",
+                        child.not_after,
+                        parent_exp
+                    );
+                }
+                // child never exceeds now+ttl (saturating)
+                assert!(child.not_after <= now.saturating_add(ttl));
+            }
+        }
+    }
+
+    #[test]
+    fn attenuate_ttl_overflow_saturates_not_panics() {
+        // now+ttl overflows u64 → saturating_add prevents wrap; infinite parent takes it.
+        let inf = Caveats { not_after: 0, ..Default::default() };
+        let c = attenuate(&inf, u64::MAX, u64::MAX);
+        assert_eq!(c.not_after, u64::MAX);
+    }
+
+    #[test]
+    fn attenuate_preserves_other_caveats() {
+        // Only not_after changes; the rest of the parent's caveats are inherited verbatim.
+        let p = Caveats { not_after: 5_000, ..Default::default() };
+        let c = attenuate(&p, 1_000, 100);
+        let mut expected = p.clone();
+        expected.not_after = 1_100;
+        assert_eq!(c, expected);
+    }
+
+    #[test]
+    fn delegate_empty_chain_is_rejected() {
+        let a = id("ec-a");
+        let b = id("ec-b");
+        assert!(delegate(&[], &a, b.node_id(), true, 10_000, 100, 7).is_err());
+    }
+
+    #[test]
+    fn delegate_with_no_replicable_abilities_is_rejected() {
+        // Parent holds only non-replicable abilities → nothing to delegate.
+        let now = 10_000;
+        let root = id("nr-root");
+        let a = id("nr-a");
+        let b = id("nr-b");
+        let chain = vec![root_cap(&root, a.node_id(), &["tunnel", "exec"], 0)];
+        assert!(delegate(&chain, &a, b.node_id(), true, now, 100, 7).is_err());
+    }
+
+    #[test]
+    fn delegate_sync_only_parent_makes_sync_leaf_even_when_replicating() {
+        // A parent that only holds `sync` cannot confer `spawn`, so even a "replicating"
+        // child gets sync only — it is structurally a leaf.
+        let now = 10_000;
+        let root = id("so-root");
+        let a = id("so-a");
+        let b = id("so-b");
+        let host = id("so-host");
+        let chain = vec![root_cap(&root, a.node_id(), &["sync"], 0)];
+        let onward = delegate(&chain, &a, b.node_id(), true, now, 100, 7).unwrap();
+        let leaf = onward.last().unwrap();
+        assert_eq!(leaf.cap.abilities, vec!["sync".to_string()]);
+        assert!(authorize(&host.node_id(), &[root.node_id()], &[], now, &b.node_id(), "sync", &onward, &never()).is_ok());
+        assert!(authorize(&host.node_id(), &[root.node_id()], &[], now, &b.node_id(), "spawn", &onward, &never()).is_err());
+    }
+
+    #[test]
+    fn delegate_chain_grows_by_exactly_one_each_hop() {
+        let now = 10_000;
+        let root = id("len-root");
+        let a = id("len-a");
+        let b = id("len-b");
+        let c = id("len-c");
+        let l0 = vec![root_cap(&root, a.node_id(), &["sync", "spawn"], 0)];
+        let l1 = delegate(&l0, &a, b.node_id(), true, now, 1000, 1).unwrap();
+        let l2 = delegate(&l1, &b, c.node_id(), true, now, 1000, 2).unwrap();
+        assert_eq!(l0.len(), 1);
+        assert_eq!(l1.len(), 2);
+        assert_eq!(l2.len(), 3);
+        // parent prefix is preserved unchanged (compared by stable cap id)
+        let ids = |chain: &[SignedCapability]| chain.iter().map(|c| c.id()).collect::<Vec<_>>();
+        assert_eq!(ids(&l2)[..2], ids(&l1)[..]);
+        assert_eq!(ids(&l1)[..1], ids(&l0)[..]);
+    }
+
+    #[test]
+    fn delegate_each_child_cap_links_to_its_parent() {
+        let now = 10_000;
+        let root = id("link-root");
+        let a = id("link-a");
+        let b = id("link-b");
+        let l0 = vec![root_cap(&root, a.node_id(), &["sync", "spawn"], 0)];
+        let l1 = delegate(&l0, &a, b.node_id(), true, now, 1000, 1).unwrap();
+        let parent = &l0[0];
+        let child = l1.last().unwrap();
+        assert_eq!(child.cap.parent, Some(parent.id()), "child must reference parent id");
+        assert_eq!(child.cap.audience, b.node_id());
+    }
+
+    #[test]
+    fn authorize_rejects_expired_delegated_cap() {
+        // A cap valid at issue time must be refused once the clock passes its expiry.
+        let now = 10_000;
+        let root = id("exp-root");
+        let a = id("exp-a");
+        let b = id("exp-b");
+        let host = id("exp-host");
+        let chain = vec![root_cap(&root, a.node_id(), &["sync", "spawn"], now + 10_000)];
+        let onward = delegate(&chain, &a, b.node_id(), true, now, 100, 7).unwrap();
+        // valid now
+        assert!(authorize(&host.node_id(), &[root.node_id()], &[], now, &b.node_id(), "sync", &onward, &never()).is_ok());
+        // expired after now+100
+        let later = now + 101;
+        assert!(authorize(&host.node_id(), &[root.node_id()], &[], later, &b.node_id(), "sync", &onward, &never()).is_err());
+    }
+
+    #[test]
+    fn authorize_rejects_unrooted_chain() {
+        // Host that does NOT list R as a root rejects the chain even if every link is valid.
+        let now = 10_000;
+        let root = id("ur-root");
+        let other_root = id("ur-other");
+        let a = id("ur-a");
+        let b = id("ur-b");
+        let host = id("ur-host");
+        let chain = vec![root_cap(&root, a.node_id(), &["sync", "spawn"], 0)];
+        let onward = delegate(&chain, &a, b.node_id(), true, now, 100, 7).unwrap();
+        // host trusts only `other_root`
+        assert!(authorize(&host.node_id(), &[other_root.node_id()], &[], now, &b.node_id(), "sync", &onward, &never()).is_err());
+    }
+
+    #[test]
+    fn authorize_honors_revocation_predicate() {
+        // Revocation is keyed by (issuer, nonce). The child link is issued by `a` with nonce 7;
+        // revoking that (issuer, nonce) pair must make authorize fail.
+        let now = 10_000;
+        let root = id("rv-root");
+        let a = id("rv-a");
+        let b = id("rv-b");
+        let host = id("rv-host");
+        let chain = vec![root_cap(&root, a.node_id(), &["sync", "spawn"], 0)];
+        let onward = delegate(&chain, &a, b.node_id(), true, now, 100, 7).unwrap();
+        let revoked_issuer = a.node_id();
+        let revoked = move |issuer: &NodeId, nonce: u64| *issuer == revoked_issuer && nonce == 7;
+        assert!(authorize(&host.node_id(), &[root.node_id()], &[], now, &b.node_id(), "sync", &onward, &revoked).is_err());
+        // with no revocation it remains valid
+        assert!(authorize(&host.node_id(), &[root.node_id()], &[], now, &b.node_id(), "sync", &onward, &never()).is_ok());
+    }
+
+    #[test]
+    fn parse_node_id_roundtrips_through_hex() {
+        let raw = [7u8; 32];
+        let hexed = hex::encode(raw);
+        let parsed = parse_node_id(&hexed).unwrap();
+        assert_eq!(parsed.as_ref(), &raw[..]);
+    }
+
+    #[test]
+    fn parse_node_id_rejects_too_long_and_empty() {
+        assert!(parse_node_id("").is_err());
+        assert!(parse_node_id(&"a".repeat(66)).is_err()); // 33 bytes
+        assert!(parse_node_id(&"a".repeat(65)).is_err()); // odd hex length
+    }
+
+    // ---- wire types (Req/Resp/check) ----
+
+    #[test]
+    fn req_serializes_with_defaulted_optional_fields() {
+        let req = Req { caps: "tok".into(), path: "x/y".into(), data_hex: Some("dead".into()), ..Default::default() };
+        let v: serde_json::Value = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["caps"], "tok");
+        assert_eq!(v["path"], "x/y");
+        assert_eq!(v["data_hex"], "dead");
+    }
+
+    #[test]
+    fn resp_deserializes_tolerantly() {
+        let ok: Resp = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert!(ok.ok && ok.error.is_none());
+        let err: Resp = serde_json::from_str(r#"{"ok":false,"error":"nope"}"#).unwrap();
+        assert!(!err.ok);
+        assert_eq!(err.error.as_deref(), Some("nope"));
+    }
+
+    #[test]
+    fn check_maps_ok_and_error_replies() {
+        let ok = serde_json::to_vec(&Resp { ok: true, ..Default::default() }).unwrap();
+        assert!(check(ok, "sync foo").is_ok());
+        let bad = serde_json::to_vec(&Resp { ok: false, error: Some("denied".into()), ..Default::default() }).unwrap();
+        let e = check(bad, "sync foo").unwrap_err();
+        assert!(e.to_string().contains("denied"));
+        // malformed reply → parse error, not a panic
+        assert!(check(b"not json".to_vec(), "sync foo").is_err());
+    }
 }
