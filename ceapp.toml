@@ -1,0 +1,17 @@
+# Self-replicating fleet bootstrapper over CE (attenuated cap delegation) — installable + supervisable through `ce app`.
+[app]
+name    = "replicator"
+version = "0.1.0"
+summary = "Self-replicating fleet bootstrapper over CE (attenuated cap delegation)"
+runtime = "native"
+publisher = "c0be11e0ce0aaa769da6f9970244947d3d32a0c0d8302fb5f41f73d7950be456"
+[native]
+bin = "replicator"
+[native.artifacts]
+"darwin-amd64" = "PLACEHOLDER_darwin_amd64"
+"linux-amd64"  = "PLACEHOLDER_linux_amd64"
+[sandbox]
+# Native host app: talks to the LOCAL node over loopback, ce-cap-gates inbound. NOT a gVisor jail.
+tier       = "none"
+net        = "loopback"
+capability = "inherit"
